@@ -47,7 +47,7 @@ log = logging.getLogger(__name__)
 # Store the Result Step report
 ALL_STEP_REPORT = OrderedDict()
 # Step result keys used by Jinja for columns name
-REPORT_KEYS = ["message", "var_name", "expected", "received"]
+REPORT_KEYS = ["message", "var_name", "expected_result", "actual_result", "succeed"]
 # Parent method being reported ; Ignore sub call (assert in an assert)
 _FUNCTION_TO_APPLY = r"|".join(["test", "run", "setup", "teardown"])
 
@@ -160,6 +160,8 @@ def _prepare_report(test_class, test_name: str) -> None:
     # Create the testClass
     if not ALL_STEP_REPORT.get(test_class_name):
         ALL_STEP_REPORT[test_class_name] = OrderedDict()
+        # Add test succeed flag 
+        ALL_STEP_REPORT[test_class_name]["succeed"] = True
         # Add header (mutable object -> dictionary fed during test)
         ALL_STEP_REPORT[test_class_name]["header"] = test_class.step_report_header
         # Add description of the test -> Always test_run
@@ -194,7 +196,7 @@ def _add_step(
     global ALL_STEP_REPORT, REPORT_KEYS
 
     ALL_STEP_REPORT[test_class_name]["test_list"][test_name].append(
-        dict(zip(REPORT_KEYS, [message, var_name, expected, received]))
+        dict(zip(REPORT_KEYS, [message, var_name, expected, received, True]))
     )
 
 
@@ -218,9 +220,9 @@ def assert_decorator(func):
         MyTest(pykiso.BasicTest):
             def test_run(self):
                 '''Here is my test description'''
-                self.step_report_header["version"] = "0.16.0"
+                self.step_report_header["Voltage"] = 5
 
-    :param func: function to decorate
+    :param func: function to decorate (expected assert method)
 
     return: The func output if it exists. Otherwise, None
     """
@@ -238,21 +240,26 @@ def assert_decorator(func):
             currentframe = inspect.currentframe()
             f_back = currentframe.f_back
             test_name = f_back.f_code.co_name
+            test_class = func.__self__
+            test_class_name = type(test_class).__name__
+            assert_name = func.__name__
 
             # filter parent call, only known function recorded
             parent_method = re.findall(_FUNCTION_TO_APPLY, test_name.lower())
             if parent_method:
-                test_class = func.__self__
-                test_class_name = type(test_class).__name__
-                assert_name = func.__name__
-
                 # Assign variables to signature
                 signature = inspect.signature(func)
                 arguments = signature.bind(*args, **kwargs).arguments
+                test_name = test_class.step_report_current_table or test_name
 
                 # 1. Gether message, var_name, expected, received
                 # 1.1 Get message. default value: ""
-                message = arguments.get("msg", "")
+
+                if test_class.step_report_message:
+                    message = test_class.step_report_message
+                    test_class.step_report_message = ""
+                else:
+                    message = arguments.get("msg", "")
 
                 # ensure message is always present in the arguments
                 # dictionary. (used in _get_expected)
@@ -277,11 +284,27 @@ def assert_decorator(func):
                     test_class_name, test_name, message, var_name, expected, received
                 )
 
+
         except Exception as e:
             log.error(f"Unable to update Step due to exception: {e}")
 
         # Run the assert method
-        return func(*args, **kwargs)
+        # When exception is thrown set test as failed and handle
+        # the test assertion exception so that report doesn`t interrupt
+        try:
+            # if not test_class.step_report_continue_on_error and not test_class.step_report_succeed:
+            #     raise Exception(test_class.step_report_last_error_message)
+            return func(*args, **kwargs)
+        except Exception as e:
+            log.error(f"Assert step exception: {e}")
+            test_class.step_report_last_error_message = f"{e}"
+            if parent_method:
+                ALL_STEP_REPORT[test_class_name]["test_list"][test_name][-1]["succeed"] = False
+                ALL_STEP_REPORT[test_class_name]["succeed"] = False
+            test_class.step_report_succeed=False
+            if not test_class.step_report_continue_on_error:
+                raise e
+
 
     return func_wrapper
 
@@ -321,10 +344,8 @@ def generate_step_report(
         failed_test = []
 
     # Update info for each test
-    success_flag = True
     for tests in [succeed_tests, failed_test]:
         for test_case in tests:
-            #
             if isinstance(test_case, TestInfo):
                 # Case of success
                 test_info = test_case
@@ -347,9 +368,6 @@ def generate_step_report(
                 ALL_STEP_REPORT[class_name]["time_result"]["Elapsed Time"] = round(
                     test_info.elapsed_time, 2
                 )
-                ALL_STEP_REPORT[class_name]["succeed"] = success_flag
-
-        success_flag = False
 
     # Render the source template
     render_environment = jinja2.Environment(loader=jinja2.FileSystemLoader(SCRIPT_PATH))
